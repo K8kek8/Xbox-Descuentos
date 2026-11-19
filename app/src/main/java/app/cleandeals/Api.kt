@@ -47,19 +47,53 @@ object Api {
     /** Saca el ID de un enlace de la tienda de Xbox/Microsoft o de un ID pegado tal cual. */
     fun extractId(text: String): String? = idRegex.find(text.uppercase())?.value
 
-    private fun httpGet(url: String): String {
+    private const val DEALS_PAGE = "https://www.microsoft.com/es-mx/store/deals/apps/xbox"
+
+    // Enlaces de producto de la página de ofertas: .../p/nombre-del-juego/9NBLGGH4R315
+    private val productLink = Regex("/p/[^/\"'?#\\s]+/([0-9A-Za-z]{12})(?=[\"'?#/\\s<])")
+    private val totalItems = Regex("\\d+\\s*-\\s*\\d+\\s+de\\s+(\\d+)")
+
+    private fun httpGet(url: String, html: Boolean = false): String {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
             conn.connectTimeout = 15_000
             conn.readTimeout = 20_000
-            conn.setRequestProperty("Accept", "application/json")
-            conn.setRequestProperty("User-Agent", "CleanDeals/1.0")
+            if (html) {
+                conn.setRequestProperty("Accept", "text/html")
+                conn.setRequestProperty("Accept-Language", "es-MX,es;q=0.9")
+                conn.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                        "Chrome/124.0 Mobile Safari/537.36",
+                )
+            } else {
+                conn.setRequestProperty("Accept", "application/json")
+                conn.setRequestProperty("User-Agent", "CleanDeals/1.0")
+            }
             val code = conn.responseCode
             if (code != 200) throw IOException("El servidor respondió con el código $code")
             return conn.inputStream.bufferedReader().use { it.readText() }
         } finally {
             conn.disconnect()
         }
+    }
+
+    private fun idsFromHtml(html: String): List<String> =
+        productLink.findAll(html).map { it.groupValues[1].uppercase() }.toList()
+
+    /**
+     * Lee la página pública de ofertas de Microsoft (50 juegos por página) y devuelve los IDs.
+     * Los precios se piden después al catálogo con [fetchProducts].
+     */
+    suspend fun fetchDealIds(): List<String> = coroutineScope {
+        val first = withContext(Dispatchers.IO) { httpGet(DEALS_PAGE, html = true) }
+        val total = totalItems.find(first)?.groupValues?.get(1)?.toIntOrNull() ?: 50
+        val rest = (50 until minOf(total, 500) step 50).map { skip ->
+            async(Dispatchers.IO) {
+                runCatching { httpGet("$DEALS_PAGE?skipitems=$skip", html = true) }.getOrDefault("")
+            }
+        }.awaitAll()
+        (listOf(first) + rest).flatMap { idsFromHtml(it) }.distinct()
     }
 
     /** Busca juegos por nombre y devuelve sus IDs (máximo 15). */

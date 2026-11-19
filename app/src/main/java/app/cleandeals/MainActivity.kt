@@ -39,6 +39,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -102,6 +103,9 @@ data class UiState(
     val searchResults: List<String> = emptyList(),
     val searching: Boolean = false,
     val searchMessage: String? = null,
+    val dealIds: List<String> = emptyList(),
+    val dealsLoading: Boolean = false,
+    val dealsError: String? = null,
 )
 
 class DealsViewModel(app: Application) : AndroidViewModel(app) {
@@ -115,6 +119,28 @@ class DealsViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         load()
+        loadDeals()
+    }
+
+    /** Lee la página de ofertas de Microsoft y pide los precios de esos juegos. */
+    fun loadDeals() {
+        viewModelScope.launch {
+            _state.update { it.copy(dealsLoading = true, dealsError = null) }
+            try {
+                val ids = Api.fetchDealIds()
+                if (ids.isEmpty()) throw java.io.IOException("No se encontraron ofertas en la página de Microsoft")
+                val fetched = Api.fetchProducts(ids)
+                _state.update {
+                    it.copy(
+                        products = it.products + fetched.associateBy { d -> d.id },
+                        dealIds = fetched.map { d -> d.id },
+                        dealsLoading = false,
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(dealsLoading = false, dealsError = e.message ?: "No se pudieron cargar las ofertas") }
+            }
+        }
     }
 
     /** Actualiza los precios de los juegos que sigues. */
@@ -215,15 +241,26 @@ fun App(vm: DealsViewModel) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var query by rememberSaveable { mutableStateOf("") }
     var onlyDeals by rememberSaveable { mutableStateOf(false) }
+    var dealQuery by rememberSaveable { mutableStateOf("") }
+    var minDiscount by rememberSaveable { mutableIntStateOf(0) }
+    var byPrice by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (tab == 0) "Mi lista · Xbox México" else "Buscar juegos") },
+                title = {
+                    Text(
+                        when (tab) {
+                            0 -> "Ofertas Xbox · México"
+                            1 -> "Mi lista"
+                            else -> "Buscar juegos"
+                        },
+                    )
+                },
                 actions = {
-                    if (tab == 0) {
-                        IconButton(onClick = { vm.load() }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Actualizar precios")
+                    if (tab != 2) {
+                        IconButton(onClick = { if (tab == 0) vm.loadDeals() else vm.load() }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Actualizar")
                         }
                     }
                 },
@@ -234,12 +271,18 @@ fun App(vm: DealsViewModel) {
                 NavigationBarItem(
                     selected = tab == 0,
                     onClick = { tab = 0 },
-                    icon = { Icon(Icons.Default.Favorite, contentDescription = null) },
-                    label = { Text("Mi lista") },
+                    icon = { Icon(Icons.Default.ShoppingCart, contentDescription = null) },
+                    label = { Text("Ofertas") },
                 )
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { tab = 1 },
+                    icon = { Icon(Icons.Default.Favorite, contentDescription = null) },
+                    label = { Text("Mi lista") },
+                )
+                NavigationBarItem(
+                    selected = tab == 2,
+                    onClick = { tab = 2 },
                     icon = { Icon(Icons.Default.Search, contentDescription = null) },
                     label = { Text("Buscar") },
                 )
@@ -247,9 +290,64 @@ fun App(vm: DealsViewModel) {
         },
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            if (s.loading || s.searching) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (s.loading || s.searching || s.dealsLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
 
             if (tab == 0) {
+                val deals = s.dealIds.mapNotNull { s.products[it] }
+                    .filter { it.discount > 0 && it.discount >= minDiscount }
+                    .filter { dealQuery.isBlank() || it.title.contains(dealQuery.trim(), ignoreCase = true) }
+                    .let { l -> if (byPrice) l.sortedBy { it.price } else l.sortedByDescending { it.discount } }
+
+                OutlinedTextField(
+                    value = dealQuery,
+                    onValueChange = { dealQuery = it },
+                    singleLine = true,
+                    label = { Text("Filtrar por nombre") },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                Row(
+                    Modifier.padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    listOf(0 to "Todas", 25 to "25%+", 50 to "50%+", 75 to "75%+").forEach { (v, label) ->
+                        FilterChip(
+                            selected = minDiscount == v,
+                            onClick = { minDiscount = v },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+                Row(
+                    Modifier.padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = !byPrice,
+                        onClick = { byPrice = false },
+                        label = { Text("Mayor descuento") },
+                    )
+                    FilterChip(
+                        selected = byPrice,
+                        onClick = { byPrice = true },
+                        label = { Text("Menor precio") },
+                    )
+                }
+                when {
+                    s.dealsError != null && s.dealIds.isEmpty() -> Column(
+                        Modifier.fillMaxSize().padding(24.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(s.dealsError ?: "", style = MaterialTheme.typography.bodyLarge)
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { vm.loadDeals() }) { Text("Reintentar") }
+                    }
+
+                    deals.isEmpty() && !s.dealsLoading -> Message("No hay ofertas con esos filtros.")
+
+                    else -> DealList(deals, s.wishlist, vm, ctx)
+                }
+            } else if (tab == 1) {
                 val list = s.wishlist.mapNotNull { s.products[it] }
                     .filter { !onlyDeals || it.discount > 0 }
                     .sortedWith(compareByDescending<Deal> { it.discount }.thenBy { it.title })
@@ -263,7 +361,7 @@ fun App(vm: DealsViewModel) {
                 }
                 when {
                     s.wishlist.isEmpty() -> Message(
-                        "Aún no sigues ningún juego. Ve a Buscar y toca el corazón de los que te interesen.",
+                        "Aún no sigues ningún juego. Toca el corazón en Ofertas o Buscar para guardarlos aquí.",
                     )
 
                     s.error != null && list.isEmpty() -> Column(
