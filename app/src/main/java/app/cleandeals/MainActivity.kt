@@ -17,9 +17,11 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -31,10 +33,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.ShoppingCart
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -69,6 +73,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -90,15 +95,17 @@ import kotlinx.coroutines.withContext
 // ---------------------------------------------------------------- Estado
 
 data class UiState(
-    val dealIds: Set<String> = emptySet(),
     val products: Map<String, Deal> = emptyMap(),
     val wishlist: Set<String> = emptySet(),
     val loading: Boolean = false,
     val error: String? = null,
+    val searchResults: List<String> = emptyList(),
+    val searching: Boolean = false,
+    val searchMessage: String? = null,
 )
 
 class DealsViewModel(app: Application) : AndroidViewModel(app) {
-    // La lista de deseos se guarda solo en el teléfono.
+    // La lista de seguimiento se guarda solo en el teléfono.
     private val prefs = app.getSharedPreferences("wishlist", Context.MODE_PRIVATE)
 
     private val _state = MutableStateFlow(
@@ -110,15 +117,50 @@ class DealsViewModel(app: Application) : AndroidViewModel(app) {
         load()
     }
 
+    /** Actualiza los precios de los juegos que sigues. */
     fun load() {
+        val ids = _state.value.wishlist
+        if (ids.isEmpty()) return
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             try {
-                val (dealIds, products) = Api.fetchAll(_state.value.wishlist)
-                _state.update { it.copy(dealIds = dealIds, products = products, loading = false) }
+                val fetched = Api.fetchProducts(ids.toList()).associateBy { it.id }
+                _state.update { it.copy(products = it.products + fetched, loading = false) }
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = e.message ?: "No se pudieron cargar los precios") }
+            }
+        }
+    }
+
+    /** Busca por nombre, o si el texto trae un enlace o ID de la tienda, usa ese juego directo. */
+    fun search(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        viewModelScope.launch {
+            _state.update { it.copy(searching = true, searchMessage = null, searchResults = emptyList()) }
+            try {
+                val ids = Api.extractId(q)?.let { listOf(it) } ?: Api.search(q)
+                val fetched = if (ids.isEmpty()) emptyList() else Api.fetchProducts(ids)
+                val order = ids.filter { id -> fetched.any { it.id == id } }
+                _state.update {
+                    it.copy(
+                        products = it.products + fetched.associateBy { d -> d.id },
+                        searchResults = order,
+                        searching = false,
+                        searchMessage = if (order.isEmpty()) {
+                            "Sin resultados. Prueba con otro nombre o pega el enlace del juego en la tienda de Xbox."
+                        } else {
+                            null
+                        },
+                    )
+                }
             } catch (e: Exception) {
                 _state.update {
-                    it.copy(loading = false, error = e.message ?: "No se pudieron cargar las ofertas")
+                    it.copy(
+                        searching = false,
+                        searchMessage = (e.message ?: "Error de conexión") +
+                            "\nSi la búsqueda por nombre falla, pega el enlace del juego de la tienda de Xbox.",
+                    )
                 }
             }
         }
@@ -151,7 +193,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun CleanTheme(content: @Composable () -> Unit) {
-    val dark = androidx.compose.foundation.isSystemInDarkTheme()
+    val dark = isSystemInDarkTheme()
     val ctx = LocalContext.current
     val scheme = when {
         Build.VERSION.SDK_INT >= 31 && dark -> dynamicDarkColorScheme(ctx)
@@ -172,29 +214,17 @@ fun App(vm: DealsViewModel) {
 
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var query by rememberSaveable { mutableStateOf("") }
-    var minDiscount by rememberSaveable { mutableIntStateOf(0) }
-    var byPrice by rememberSaveable { mutableStateOf(false) }
-
-    val shown: List<Deal> = if (tab == 0) {
-        s.dealIds.mapNotNull { s.products[it] }
-            .filter { it.discount > 0 && it.discount >= minDiscount }
-            .filter { query.isBlank() || it.title.contains(query.trim(), ignoreCase = true) }
-            .let { list ->
-                if (byPrice) list.sortedBy { it.price } else list.sortedByDescending { it.discount }
-            }
-    } else {
-        s.wishlist.mapNotNull { s.products[it] }
-            .filter { query.isBlank() || it.title.contains(query.trim(), ignoreCase = true) }
-            .sortedWith(compareByDescending<Deal> { it.discount }.thenBy { it.title })
-    }
+    var onlyDeals by rememberSaveable { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (tab == 0) "Ofertas Xbox · México" else "Mi lista de deseos") },
+                title = { Text(if (tab == 0) "Mi lista · Xbox México" else "Buscar juegos") },
                 actions = {
-                    IconButton(onClick = { vm.load() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Actualizar")
+                    if (tab == 0) {
+                        IconButton(onClick = { vm.load() }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Actualizar precios")
+                        }
                     }
                 },
             )
@@ -204,98 +234,103 @@ fun App(vm: DealsViewModel) {
                 NavigationBarItem(
                     selected = tab == 0,
                     onClick = { tab = 0 },
-                    icon = { Icon(Icons.Default.ShoppingCart, contentDescription = null) },
-                    label = { Text("Ofertas") },
+                    icon = { Icon(Icons.Default.Favorite, contentDescription = null) },
+                    label = { Text("Mi lista") },
                 )
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { tab = 1 },
-                    icon = { Icon(Icons.Default.Favorite, contentDescription = null) },
-                    label = { Text("Deseos") },
+                    icon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    label = { Text("Buscar") },
                 )
             }
         },
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            if (s.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                singleLine = true,
-                label = { Text("Buscar juego") },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            )
+            if (s.loading || s.searching) LinearProgressIndicator(Modifier.fillMaxWidth())
 
             if (tab == 0) {
-                Row(
-                    Modifier.padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    listOf(0 to "Todas", 25 to "25%+", 50 to "50%+", 75 to "75%+").forEach { (v, label) ->
-                        FilterChip(
-                            selected = minDiscount == v,
-                            onClick = { minDiscount = v },
-                            label = { Text(label) },
-                        )
-                    }
+                val list = s.wishlist.mapNotNull { s.products[it] }
+                    .filter { !onlyDeals || it.discount > 0 }
+                    .sortedWith(compareByDescending<Deal> { it.discount }.thenBy { it.title })
+
+                Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    FilterChip(
+                        selected = onlyDeals,
+                        onClick = { onlyDeals = !onlyDeals },
+                        label = { Text("Solo en oferta") },
+                    )
                 }
-                Row(
-                    Modifier.padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FilterChip(
-                        selected = !byPrice,
-                        onClick = { byPrice = false },
-                        label = { Text("Mayor descuento") },
+                when {
+                    s.wishlist.isEmpty() -> Message(
+                        "Aún no sigues ningún juego. Ve a Buscar y toca el corazón de los que te interesen.",
                     )
-                    FilterChip(
-                        selected = byPrice,
-                        onClick = { byPrice = true },
-                        label = { Text("Menor precio") },
+
+                    s.error != null && list.isEmpty() -> Column(
+                        Modifier.fillMaxSize().padding(24.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(s.error ?: "", style = MaterialTheme.typography.bodyLarge)
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { vm.load() }) { Text("Reintentar") }
+                    }
+
+                    list.isEmpty() && !s.loading -> Message(
+                        if (onlyDeals) "Ninguno de tus juegos está en oferta ahora mismo." else "Cargando…",
                     )
+
+                    else -> DealList(list, s.wishlist, vm, ctx)
+                }
+            } else {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    singleLine = true,
+                    label = { Text("Nombre del juego o enlace de la tienda") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { vm.search(query) }),
+                    trailingIcon = {
+                        IconButton(onClick = { vm.search(query) }) {
+                            Icon(Icons.Default.Search, contentDescription = "Buscar")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                val results = s.searchResults.mapNotNull { s.products[it] }
+                when {
+                    s.searchMessage != null -> Message(s.searchMessage ?: "")
+                    results.isEmpty() && !s.searching -> Message(
+                        "Escribe el nombre de un juego, o pega el enlace de su página en xbox.com.",
+                    )
+
+                    else -> DealList(results, s.wishlist, vm, ctx)
                 }
             }
+        }
+    }
+}
 
-            when {
-                s.error != null && s.products.isEmpty() -> Column(
-                    Modifier.fillMaxSize().padding(24.dp),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(s.error ?: "", style = MaterialTheme.typography.bodyLarge)
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = { vm.load() }) { Text("Reintentar") }
-                }
+@Composable
+private fun Message(text: String) {
+    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+        Text(text, style = MaterialTheme.typography.bodyLarge)
+    }
+}
 
-                shown.isEmpty() && !s.loading -> Box(
-                    Modifier.fillMaxSize().padding(24.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        if (tab == 1 && s.wishlist.isEmpty()) {
-                            "Toca el corazón de un juego para guardarlo aquí."
-                        } else {
-                            "No hay resultados."
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
-                }
-
-                else -> LazyColumn(
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    items(shown, key = { it.id }) { d ->
-                        DealCard(
-                            d = d,
-                            wished = d.id in s.wishlist,
-                            onToggle = { vm.toggleWish(d.id) },
-                            onOpen = { openStore(ctx, d.id) },
-                        )
-                    }
-                }
-            }
+@Composable
+private fun DealList(list: List<Deal>, wishlist: Set<String>, vm: DealsViewModel, ctx: Context) {
+    LazyColumn(
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        items(list, key = { it.id }) { d ->
+            DealCard(
+                d = d,
+                wished = d.id in wishlist,
+                onToggle = { vm.toggleWish(d.id) },
+                onOpen = { openStore(ctx, d.id) },
+            )
         }
     }
 }
@@ -349,7 +384,7 @@ fun DealCard(d: Deal, wished: Boolean, onToggle: () -> Unit, onOpen: () -> Unit)
             IconButton(onClick = onToggle) {
                 Icon(
                     Icons.Default.Favorite,
-                    contentDescription = "Lista de deseos",
+                    contentDescription = "Seguir juego",
                     tint = if (wished) Color(0xFFE53935) else MaterialTheme.colorScheme.outline,
                 )
             }

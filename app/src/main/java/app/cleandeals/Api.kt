@@ -25,21 +25,27 @@ data class Deal(
 
 /**
  * Toda la comunicación con la red vive en este archivo.
- * Se usan dos endpoints del catálogo público de Microsoft Store (los mismos que usa la
- * tienda web). No son una API oficial documentada, así que si algún día cambian,
- * este es el único archivo que hay que ajustar.
+ * Solo se usa el catálogo público de Microsoft Store (displaycatalog.mp.microsoft.com):
+ * precios por ID y búsqueda por nombre. No es una API oficial documentada, así que si
+ * algún día cambia, este es el único archivo que hay que ajustar.
  */
 object Api {
     const val MARKET = "MX"
     const val LANGUAGE = "es-MX"
 
-    private const val DEALS_LIST =
-        "https://reco-public.rec.mp.microsoft.com/channels/Reco/v8.0/lists/collection/Deals" +
-            "?market=$MARKET&language=$LANGUAGE&itemTypes=Game&deviceFamily=Windows.Xbox&count=200"
+    private const val BASE = "https://displaycatalog.mp.microsoft.com"
 
     private const val CATALOG =
-        "https://displaycatalog.mp.microsoft.com/v7.0/products" +
-            "?market=$MARKET&languages=$LANGUAGE&MS-CV=DGU1mcuYo0WMMp%2BF.1"
+        "$BASE/v7.0/products?market=$MARKET&languages=$LANGUAGE&MS-CV=DGU1mcuYo0WMMp%2BF.1"
+
+    private const val SUGGEST =
+        "$BASE/v7.0/productFamilies/autosuggest?market=$MARKET&languages=$LANGUAGE&mediaType=games"
+
+    // Un ID de la tienda tiene 12 letras/números y al menos un número (p. ej. 9NBLGGH4R315).
+    private val idRegex = Regex("\\b(?=[0-9A-Z]*\\d)[0-9A-Z]{12}\\b")
+
+    /** Saca el ID de un enlace de la tienda de Xbox/Microsoft o de un ID pegado tal cual. */
+    fun extractId(text: String): String? = idRegex.find(text.uppercase())?.value
 
     private fun httpGet(url: String): String {
         val conn = URL(url).openConnection() as HttpURLConnection
@@ -56,22 +62,26 @@ object Api {
         }
     }
 
-    /** IDs de los juegos que Microsoft marca como oferta. */
-    private fun fetchDealIds(): List<String> {
-        val text = httpGet(DEALS_LIST)
-        val arr: JSONArray = if (text.trimStart().startsWith("[")) {
-            JSONArray(text)
-        } else {
-            val root = JSONObject(text)
-            root.optJSONArray("Items") ?: root.optJSONArray("items") ?: JSONArray()
+    /** Busca juegos por nombre y devuelve sus IDs (máximo 15). */
+    suspend fun search(query: String): List<String> = withContext(Dispatchers.IO) {
+        val text = httpGet("$SUGGEST&query=" + java.net.URLEncoder.encode(query, "UTF-8"))
+        val sets = JSONObject(text).optJSONArray("ResultSets") ?: JSONArray()
+        val ids = LinkedHashSet<String>()
+        for (i in 0 until sets.length()) {
+            val suggests = sets.optJSONObject(i)?.optJSONArray("Suggests") ?: continue
+            for (j in 0 until suggests.length()) {
+                val metas = suggests.optJSONObject(j)?.optJSONArray("Metas") ?: continue
+                for (k in 0 until metas.length()) {
+                    val m = metas.optJSONObject(k) ?: continue
+                    val key = m.optString("Key")
+                    if (key == "BigCatalogId" || key == "ProductId") {
+                        val v = m.optString("Value")
+                        if (v.isNotEmpty()) ids.add(v)
+                    }
+                }
+            }
         }
-        val ids = ArrayList<String>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val id = o.optString("Id").ifEmpty { o.optString("id") }
-            if (id.isNotEmpty()) ids.add(id)
-        }
-        return ids
+        ids.take(15)
     }
 
     private fun parseProducts(text: String): List<Deal> {
@@ -150,12 +160,5 @@ object Api {
         val ok = results.filter { it.isSuccess }
         if (ok.isEmpty() && results.isNotEmpty()) throw results.first().exceptionOrNull()!!
         ok.flatMap { it.getOrDefault(emptyList()) }
-    }
-
-    /** Devuelve (ofertas del momento + productos extra pedidos, p. ej. la lista de deseos). */
-    suspend fun fetchAll(extraIds: Set<String>): Pair<Set<String>, Map<String, Deal>> {
-        val dealIds = withContext(Dispatchers.IO) { fetchDealIds() }
-        val products = fetchProducts(dealIds + extraIds)
-        return dealIds.toSet() to products.associateBy { it.id }
     }
 }
